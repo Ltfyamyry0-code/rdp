@@ -8,6 +8,8 @@ jobs:
     runs-on: windows-latest
 
     steps:
+
+      # ----------------------------- RDP Core Settings -----------------------------
       - name: Configure Core RDP Settings
         run: |
           # Enable Remote Desktop and disable Network Level Authentication
@@ -22,9 +24,11 @@ jobs:
           netsh advfirewall firewall delete rule name="RDP-Tailscale" >$null 2>&1
           netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
 
-          # Restart the Remote Desktop service
+          # Restart RDP service
           Restart-Service -Name TermService -Force
 
+
+      # ----------------------------- Create RDP User -----------------------------
       - name: Create RDP User with Fixed Password
         run: |
           $password = "Amirali.138800"
@@ -32,9 +36,11 @@ jobs:
           New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
-          
+
           echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
 
+
+      # ----------------------------- Install Tailscale -----------------------------
       - name: Install Tailscale
         run: |
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
@@ -43,9 +49,11 @@ jobs:
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
           Start-Process msiexec.exe -ArgumentList "/i", $installerPath, "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
-          
+
           & "$env:ProgramFiles\Tailscale\tailscale.exe" version
 
+
+      # ----------------------------- Connect Tailscale -----------------------------
       - name: Establish Tailscale Connection
         run: |
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
@@ -63,6 +71,40 @@ jobs:
           }
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
 
+
+      # ----------------------------- Windows Customization -----------------------------
+      - name: Windows Customization (Dark Mode, Taskbar Hide, Persian Language)
+        run: |
+          # Dark mode
+          Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize" -Name "AppsUseLightTheme" -Value 0 -Force
+          Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize" -Name "SystemUsesLightTheme" -Value 0 -Force
+          
+          # Hide Taskbar (auto-hide)
+          Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StuckRects3" `
+            -Name "Settings" -Value ([byte[]](0x30,0x00,0x00,0x00,0xfe,0xff,0xff,0xff,0x01,0x00,0x00,0x00,0x03,0x00,0x00,0x00,0x3c,0x00,0x00,0x00,0x22,0x05,0x00,0x00,0x22,0x05,0x00,0x00)) -Force
+          Stop-Process -Name explorer -Force
+
+          # Add Persian language + keyboard
+          dism.exe /online /add-capability /capabilityname:Language.Basic~~~fa-IR~0.0.1.0
+          
+          $LangList = New-WinUserLanguageList fa-IR
+          $LangList.Add("en-US")
+          Set-WinUserLanguageList $LangList -Force
+
+
+      # ----------------------------- Install Windsurf -----------------------------
+      - name: Install Windsurf
+        run: |
+          $url = "https://windsurf-stable.codeiumdata.com/win32-x64-user/stable/8b6a7c68fb76075b29a085605ef19c1d660a258e/WindsurfUserSetup-x64-1.12.43.exe"
+          $installer = "$env:TEMP\windsurf.exe"
+
+          Invoke-WebRequest -Uri $url -OutFile $installer
+          Start-Process -FilePath $installer -ArgumentList "/silent", "/verysilent", "/sp-", "/suppressmsgboxes" -Wait
+
+          Remove-Item $installer -Force
+
+
+      # ----------------------------- Verify Connection -----------------------------
       - name: Verify RDP Accessibility
         run: |
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
@@ -73,6 +115,8 @@ jobs:
           }
           Write-Host "TCP connectivity successful!"
 
+
+      # ----------------------------- Keep Runner Alive -----------------------------
       - name: Keep Runner Alive
         if: always()
         run: |
@@ -82,7 +126,6 @@ jobs:
           Write-Host "Password: $env:RDP_PASSWORD"
           Write-Host "==================`n"
           
-          # Infinite loop to keep runner alive until timeout/cancel
           while ($true) {
               Write-Host "[$(Get-Date)] RDP session active"
               Start-Sleep -Seconds 600
