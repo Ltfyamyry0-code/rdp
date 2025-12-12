@@ -8,71 +8,82 @@ jobs:
     runs-on: windows-latest
 
     steps:
-
-      - name: RDP Base Config
+      - name: Configure Core RDP Settings
         run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
-          
-          netsh advfirewall firewall add rule name="RDP" dir=in action=allow protocol=TCP localport=3389
+          # Enable Remote Desktop and disable Network Level Authentication
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
+
+          # Configure firewall for RDP
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" >$null 2>&1
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+
+          # Restart the Remote Desktop service
           Restart-Service -Name TermService -Force
 
-      - name: Create User
+      - name: Create RDP User with Fixed Password
         run: |
           $password = "Amirali.138800"
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
           New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
+          
           echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
 
       - name: Install Tailscale
         run: |
-          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $path = "$env:TEMP\ts.msi"
-          Invoke-WebRequest -Uri $url -OutFile $path
-          Start-Process msiexec.exe -ArgumentList "/i $path /quiet" -Wait
-          Remove-Item $path
-
-      - name: Connect Tailscale
-        run: |
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }}
-          $ip = (& "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4)[0]
-          echo "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
-
-      - name: Windows Quick Customization
-        run: |
-          # Dark mode
-          Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize" -Name "AppsUseLightTheme" -Value 0 -Force
-          Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize" -Name "SystemUsesLightTheme" -Value 0 -Force
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
           
-          # Hide taskbar
-          Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StuckRects3" -Name "Settings" -Value ([byte[]](0x30,0,0,0,0xfe,0xff,0xff,0xff,1,0,0,0,3,0,0,0,0x3c,0,0,0,0x22,5,0,0,0x22,5,0,0)) -Force
-          Stop-Process -Name explorer -Force
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", $installerPath, "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+          
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" version
 
-          # Add Persian keyboard only (fast)
-          $LangList = New-WinUserLanguageList fa-IR
-          $LangList.Add("en-US")
-          Set-WinUserLanguageList $LangList -Force
-
-      - name: Install Windsurf (Fast)
+      - name: Establish Tailscale Connection
         run: |
-          $url = "https://windsurf-stable.codeiumdata.com/win32-x64-user/stable/8b6a7c68fb76075b29a085605ef19c1d660a258e/WindsurfUserSetup-x64-1.12.43.exe"
-          $exe = "$env:TEMP\windsurf.exe"
-          Invoke-WebRequest $url -OutFile $exe
-          Start-Process $exe -ArgumentList "/silent" -Wait
-          Remove-Item $exe
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          
+          # Wait for IP
+          $tsIP = $null
+          for ($i=0; $i -lt 10 -and -not $tsIP; $i++) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+          }
+          
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned"
+              exit 1
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
 
-      - name: Show RDP Info
+      - name: Verify RDP Accessibility
         run: |
-          Write-Host "IP: $env:TAILSCALE_IP"
-          Write-Host "User: RDP"
-          Write-Host "Pass: $env:RDP_PASSWORD"
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
+          Write-Host "TCP connectivity successful!"
 
-      - name: Keep Alive
+      - name: Keep Runner Alive
+        if: always()
         run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $env:RDP_PASSWORD"
+          Write-Host "==================`n"
+          
+          # Infinite loop to keep runner alive until timeout/cancel
           while ($true) {
-            Write-Host "Running..."
-            Start-Sleep -Seconds 600
+              Write-Host "[$(Get-Date)] RDP session active"
+              Start-Sleep -Seconds 600
           }
